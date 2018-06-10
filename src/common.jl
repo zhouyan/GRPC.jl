@@ -60,7 +60,8 @@ function deserialize(data::Vector{UInt8}, msg::ProtoType)
     if read(buf, Bool)
         error("Compression not implemented")
     end
-    @assert ntoh(read(buf, UInt32)) == readproto(buf, msg)
+    @assert ntoh(read(buf, UInt32)) == length(data) - 5
+    readproto(buf, msg)
 end
 
 function send_message(connection::HTTPConnection, stream_id::UInt32,
