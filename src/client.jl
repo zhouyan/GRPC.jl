@@ -1,10 +1,14 @@
-import Base: open, close, start, next, done, connect
+import Base: put!, take!, fetch, isopen, collect, start, next, done
 import HttpCommon: Headers
-import HTTP2.Session: HTTPConnection, ActSendHeaders
-import HTTP2.Session: EvtRecvHeaders
-import HTTP2.Session: put_act!, take_evt!
+import HTTP2.Session: HTTPConnection
+import HTTP2.Session: ActSendHeaders, ActSendData
+import HTTP2.Session: EvtRecvHeaders, EvtRecvData, EvtGoaway
 import HTTP2.Session: new_connection, next_free_stream_identifier
 import ProtoBuf: ProtoType
+
+################################################################################
+# Channel, manage raw connection
+################################################################################
 
 struct ClientChannel
     host::AbstractString
@@ -12,11 +16,39 @@ struct ClientChannel
     socket::TCPSocket
     connection::HTTPConnection
     authority::AbstractString
+    receiver::Dict{UInt32,Channel}
+    processor::Task
 
     function ClientChannel(host::AbstractString, port::Integer)
         socket = connect(host, port)
         connection = new_connection(socket, isclient = true)
-        new(host, port, socket, connection, "$host:$port")
+        authority = "$host:$port"
+        receiver = Dict{UInt32,Channel}()
+
+        processor = @schedule begin
+            while true
+                if connection.closed
+                    if !isempty(receiver)
+                        throw(ProtocolError("Connection lost"))
+                    end
+                    break
+                end
+
+                evt = take!(connection)
+
+                if !haskey(receiver, evt.stream_identifier)
+                    throw(ProtocolError("Stream removed"))
+                end
+
+                if !(evt isa EvtRecvHeaders || evt isa EvtRecvData)
+                    throw(ProtocolError("Unexpected event type $(typeof(evt))"))
+                end
+
+                put!(receiver[evt.stream_identifier], evt)
+            end
+        end
+
+        new(host, port, socket, connection, authority, receiver, processor)
     end
 end
 
@@ -40,247 +72,205 @@ function ClientChannel(host::AbstractString)
     ClientChannel(host, port)
 end
 
-function send_message(channel::ClientChannel, stream_id, message::ProtoType,
-                      is_end = false)
-    send_message(channel.connection, stream_id, message, is_end)
+function isopen(channel::ClientChannel, stream_id::UInt32)
+    haskey(channel.receiver, stream_id)
 end
 
-function recv_message(channel::ClientChannel, ::Type{T}) where T <: ProtoType
-    recv_message(channel.connection, T)
+function put!(channel::ClientChannel, request::ServiceRequest,
+              stream_id::UInt32, isend::Bool)
+    if !isopen(channel, stream_id)
+        throw(ProtocolError("Stream removed"))
+    end
+    put!(channel.connection, ActSendHeaders(stream_id, request, isend))
 end
 
-mutable struct ClientStream
-    id::UInt32
-
-    channel::ClientChannel
-    request::Request
-    send_type::Type
-    recv_type::Type
-
-    send_request_done::Bool
-    recv_initial_metadata_done::Bool
-    recv_trailing_metadata_done::Bool
-    cancel_done::Bool
-    finished::Bool
-
-    send_message_count::Int
-    recv_message_count::Int
-
-    initial_metadata::Nullable{Metadata}
-    trailing_metadata::Nullable{Metadata}
-
-    function ClientStream(channel::ClientChannel, request::Request,
-                          send_type::Type, recv_type::Type)
-        ret = new(0, channel, request, send_type, recv_type,
-                  false,  false, false, false, false, 0, 0,
-                  Nullable{Metadata}(), Nullable{Metadata}())
-        # TODO finalizer
+function put!(channel::ClientChannel, message::ProtoType,
+              stream_id::UInt32, isend::Bool)
+    if !isopen(channel, stream_id)
+        throw(ProtocolError("Stream removed"))
     end
+
+    put!(channel.connection, ActSendData(stream_id, pack(message), isend))
 end
 
-# TODO open/close connections and stream
+################################################################################
+# Stream, manage GRPC call connection
+################################################################################
 
-function connect(stream::ClientStream)
-    if stream.channel.connection.closed
-        stream.channel = ClientChannel(stream.channel.host, stream.channel.port)
-    end
-end
-
-function send_request(stream::ClientStream)
-    if stream.send_request_done
-        throw(ProtocalError("Request is already sent"))
-    end
-
-    connect(stream)
-    stream.id = next_free_stream_identifier(stream.channel.connection)
-    put_act!(stream.channel.connection,
-             ActSendHeaders(stream.id, stream.request, false))
-    stream.send_request_done = true
-end
-
-function recv_initial_metadata(stream::ClientStream)
-    if !stream.send_request_done
-        throw(ProtocolError("Request is not sent yet"))
-    end
-
-    if stream.recv_initial_metadata_done
-        throw(ProtocolError("Initial metadata was already received"))
-    end
-
-    # TODO Deadline
-
-    evt = take_evt!(stream.channel.connection)
-    if !(evt isa EvtRecvHeaders)
-        throw(ProtocolError("Failed to receive initial metadata. Got $evt"))
-    end
-
-    headers = evt.headers
-    stream.recv_initial_metadata_done = true
-    stream.initial_metadata = Meatadata(headers)
-
-    headrs_map = Dict(headers)
-    @assert headers["status"] == "200"
-    @assert headers_map["content-type"] in CONTENT_TYPES
-
-    status_code = get(headers, "grpc_status", nothing)
-    if !(status_code isa Void)
-        status = Status(parse(Int, status_code))
-        if status != OK
-            status_message = get(headers, "grpc-message", "")
-            throw(GRPCError(status, status_message))
-        end
-    end
-end
-
-function recv_trailing_metadata(stream::ClientStream)
-    if stream.recv_message_count == 0
-        throw(ProtocolError(string("No messages were received before  waiting ",
-                                   " for trailing metadata")))
-    end
-
-    if stream.recv_trailing_metadata_done
-        throw(ProtocolError("Trailing metadta was already received"))
-    end
-
-    # TODO Deadline
-
-    evt = take_evt!(stream.channel.connection)
-    if !(evt isa EvtRecvHeaders)
-        throw(ProtocolError("Failed to receive trailing metadata. Got $evt"))
-    end
-
-    headers = evt.headers
-    stream.recv_trailing_metadata_done = true
-    stream.trailing_metadata = Metadata(headers)
-
-    headers_map = dict(headers)
-    status_code = headers_map["grpc-status"]
-    status_message = get(headers_map, "grpc-message", "")
-    status = Status(parse(Int, status_code))
+function process_headers(headers::Headers)
+    @assert headers[":status"] == "200"
+    @assert headers["content-type"] in CONTENT_TYPES
+    status = Status(parse(Int, get(headers, "grpc-status", string(Int(OK)))))
     if status != OK
+        status_message = get(headers, "grpc-message", "")
         throw(GRPCError(status, status_message))
     end
 end
 
-function send_message(stream::ClientStream, message::ProtoType, finish)
-    @assert message isa stream.send_type
-
-    if !stream.send_request_done
-        send_request(stream)
-    end
-
-    if finish && stream.finished
-        throw(ProtocolError("Stream already ended"))
-    end
-
-    send_message(stream.channel, stream.id, message, finish)
-
-    stream.send_message_count += 1
-    if finish
-        stream.finished = true
+function process_trailers(headers::Headers)
+    status = Status(parse(Int, headers["grpc-status"]))
+    if status != OK
+        status_message = get(headers_map, "grpc-message", "")
+        throw(GRPCError(status, status_message))
     end
 end
 
-function recv_message(stream::ClientStream)
-    if !stream.recv_initial_metadata_done
-        recv_initial_metadata(stream)
-    end
-
-    # TODO Deadline
-
-    message = recv_message(stream.channel, stream.recv_type)
-    if message isa Void
-        recv_trailing_metadata(stream)
-    else
-        stream.recv_message_count += 1
-    end
-    message
-end
-
-start(stream::ClientStream) = stream
-
-function next(stream::ClientStream, state)
-    recv_message(stream), state
-end
-
-function done(stream::ClientStream, state)
-    stream.recv_trailing_metadata_done
-end
-
-function finish(stream::ClientStream)
-    if stream.finished
-        throw(ProtocolError("Stream was already ended"))
-    end
-
-    # TODO
-
-    stream.finished = true
-end
-
-# TODO cancel
-
-function request(channel::ClientChannel, name, request_type, response_type;
-                 timeout = Nullable(Number), deadline = Nullable{Deadline}(),
-                 metadata = Nullable(Metadata))
-    if !isnull(timeout) && isnull(deadline)
-        deadline = Nullable(Deadline(get(timeout)))
-    elseif !isnull(timeout) && !isnull(deadline)
-        deadline = Nullable(min(Deadline(get(timeout)), get(deadline)))
-    else
-        deadline = Nullable{Deadline}()
-    end
-
-    req = Request("POST", "http", name, channel.authority,
-                  content_type = CONTENT_TYPE, user_agent = "grpc-julia-GRPC",
-                  metadata = metadata, deadline = deadline)
-
-    ClientStream(channel, req, request_type, response_type)
-end
-
-struct ServiceMethod
+mutable struct ClientStream{T,U}
     channel::ClientChannel
-    name::AbstractString
-    request_type::Type
-    response_type::Type
-end
+    method_name::AbstractString
+    metadata::Nullable{Metadata}
+    deadline::Nullable{Deadline}
 
-function open(func::Function, method::ServiceMethod;
-              timeout = Nullable{Number}(),
-              metadata = Nullable{Metadata}())
-    stream = request(method.channel, method.name,
-                     method.request_type, method.response_type,
-                     timeout = timeout, metadata = metadata)
-    try
-        return func(stream)
-    finally
-        # close(stream) # TODO
-    end
-end
+    stream_id::UInt32
+    receiver::Channel
 
-function unary_unary_method(method, request; kwargs...)
-    open(method; kwargs...) do stream
-        send_message(stream, request, true)
-        recv_message(stream)
-    end
-end
+    requests::Channel{Tuple{T,Bool}}
+    request_processor::Task
 
-function unary_stream_method(method, request; kwargs...)
-    open(method; kwargs...) do stream
-        send_message(stream, request, true)
-        for response in stream
-            if !(resopnse isa Void)
-                put!(channel, response)
+    responses::Channel{U}
+    response_processor::Task
+
+    buffer::Vector{UInt8}
+    headers::Nullable{Headers}
+    trailers::Nullable{Headers}
+
+    function ClientStream{RequestType, ResponseType}(channel::ClientChannel,
+                                                     method_name::AbstractString;
+                                                     metadata = Nullable{Metadata}(),
+                                                     deadline = Nullable{Deadline}()) where
+        {RequestType,ResponseType}
+
+        ret = new{RequestType,ResponseType}()
+
+        ret.channel = channel
+        ret.method_name = method_name
+        ret.metadata = metadata
+        ret.deadline = deadline
+
+        ret.stream_id = next_free_stream_identifier(ret.channel.connection)
+
+        ret.receiver = Channel(32)
+        bind(ret.receiver, ret.channel.processor)
+        ret.channel.receiver[ret.stream_id] = ret.receiver
+
+        ret.requests = Channel{Tuple{RequestType,Bool}}(32)
+
+        ret.request_processor = @schedule begin
+            request = ServiceRequest("POST", "http", method_name,
+                                     ret.channel.authority,
+                                     content_type = CONTENT_TYPE,
+                                     user_agent = "grpc-julia-GRPC",
+                                     metadata = metadata, deadline = deadline)
+            put!(ret.channel, request, ret.stream_id, false)
+            for (req, isend) in ret.requests
+                put!(ret.channel, req, ret.stream_id, isend)
+                yield()
             end
         end
+
+        bind(ret.requests, ret.request_processor)
+
+        ret.responses = Channel{ResponseType}(32)
+        ret.buffer = Vector{UInt8}()
+
+        ret.response_processor = @schedule begin
+            wait(ret.receiver)
+            evt = take!(ret.receiver)
+
+            if !(evt isa EvtRecvHeaders)
+                throw(ProtocolError("Failed to receive initial metadata"))
+            end
+
+            ret.headers = evt.headers
+            process_headers(evt.headers)
+
+            if evt.is_end_stream
+                throw(ProtocolError("Failed to receive message data"))
+            end
+
+            while true
+                wait(ret.receiver)
+                evt = take!(ret.receiver)
+
+                if evt isa EvtRecvHeaders
+                    ret.trailers = evt.headers
+                    process_trailers(evt.headers)
+
+                    if !evt.is_end_stream
+                        throw(ProtocolError("Failed to receive end of stream"))
+                    end
+
+                    break
+                elseif evt.is_end_stream
+                    throw(ProtocolError("Failed to receive trailing metadata"))
+                end
+
+                # process message data
+
+                append!(ret.buffer, evt.data)
+                if length(ret.buffer) < 5
+                    throw(ProtocolError("Incomplete message header"))
+                end
+
+                len = ntoh(read(IOBuffer(ret.buffer[2:5]), UInt32)) + 5
+                while length(ret.buffer) < len
+                    wait(ret.receiver)
+                    evt = take!(ret.receiver)
+                    if !(evt isa EvtRecvData)
+                        throw(ProtocolError("Incomplete message data"))
+                    end
+                    append!(ret.buffer, evt.data)
+                end
+
+                if length(ret.buffer) == len
+                    put!(ret.responses, unpack(ret.buffer, ResponseType))
+                    resize!(ret.buffer, 0)
+                else
+                    put!(ret.responses, unpack(ret.buffer[1:len], ResponseType))
+                    ret.buffer = ret.buffer[(len + 1):end]
+                end
+            end
+        end
+        bind(ret.responses, ret.response_processor)
+
+        ret
     end
 end
 
-function stream_unary_methdo(method, request; kwargs...)
-    nothing
-    open(method; kwargs...) do stream
-        for req in request
-            send_message(stream, req)
-        end
-        recv_message(stream)
+function put!(stream::ClientStream{RequestType,ResponseType}, request) where
+    {RequestType, ResponseType}
+    put!(stream.requests, request)
+    if request[2]
+        close(stream.requests)
     end
+end
+
+function take!(stream::ClientStream{RequestType,ResponseType}) where
+    {RequestType, ResponseType}
+    take!(stream.responses)
+end
+
+function fetch(stream::ClientStream{RequestType,ResponseType}) where
+    {RequestType, ResponseType}
+    fetch(stream.responses)
+end
+
+function collect(stream::ClientStream{RequestType,ResponseType}) where
+    {RequestType, ResponseType}
+    collect(stream.responses)
+end
+
+function start(stream::ClientStream{RequestType,ResponseType}) where
+    {RequestType, ResponseType}
+    start(stream.resopnse)
+end
+
+function next(stream::ClientStream{RequestType,ResponseType}, state) where
+    {RequestType, ResponseType}
+    next(stream.resopnse, state)
+end
+
+function done(stream::ClientStream{RequestType,ResponseType}, state) where
+    {RequestType, ResponseType}
+    done(stream.resopnse, state)
 end

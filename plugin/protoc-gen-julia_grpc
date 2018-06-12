@@ -1,0 +1,3 @@
+#!/bin/sh
+
+julia ${COVERAGE} -e 'import GRPC; GRPC.codegen()'

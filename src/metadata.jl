@@ -87,7 +87,7 @@ function time_remaining(dt::Deadline)
     t >= dt.timestamp ? 0.0 : (dt.timestamp - t) * 1e-9
 end
 
-struct Request
+struct ServiceRequest
     method::AbstractString
     scheme::AbstractString
     path::AbstractString
@@ -100,27 +100,28 @@ struct Request
     metadata::Nullable{Metadata}
     deadline::Nullable{Deadline}
 
-    function Request(method::AbstractString, scheme::AbstractString,
-                     path::AbstractString, authority::AbstractString;
-                     content_type = Nullable{AbstractString}(),
-                     message_type = Nullable{AbstractString}(),
-                     message_econding = Nullable{AbstractString}(),
-                     message_accept_encoding = Nullable{AbstractString}(),
-                     user_agent = Nullable{AbstractString}(),
-                     metadata = Nullable{Metadata}(),
-                     deadline = Nullable{Deadline}())
+    function ServiceRequest(method::AbstractString, scheme::AbstractString,
+                            path::AbstractString, authority::AbstractString;
+                            content_type = Nullable{AbstractString}(),
+                            message_type = Nullable{AbstractString}(),
+                            message_econding = Nullable{AbstractString}(),
+                            message_accept_encoding = Nullable{AbstractString}(),
+                            user_agent = Nullable{AbstractString}(),
+                            metadata = Nullable{Metadata}(),
+                            deadline = Nullable{Deadline}())
         new(method, scheme, path, authority, content_type,
             message_type, message_econding, message_accept_encoding,
             user_agent, metadata, deadline)
     end
 end
 
-function convert(::Type{Headers}, request::Request)
+function convert(::Type{Headers}, request::ServiceRequest)
     ret = Headers(
                   ":method" => request.method,
                   ":scheme" => request.scheme,
                   ":path" => request.path,
                   ":authority" => request.authority,
+                  "te" => "trailers",
                  )
 
     if !isnull(request.deadline)

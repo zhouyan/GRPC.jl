@@ -1,6 +1,5 @@
 import HTTP2.Session: HTTPConnection, ActSendData, EvtGoaway
-import HTTP2.Session: take_evt!, put_act!
-import ProtoBuf: ProtoType, writeproto, readproto
+import ProtoBuf: ProtoType, writeproto, readproto, clear
 
 const CONTENT_TYPE = "application/grpc+proto"
 const CONTENT_TYPES = ("application/grpc", "application/grpc+proto")
@@ -45,7 +44,7 @@ struct ProtocolError <: Exception
     message::AbstractString
 end
 
-function serialize(msg::ProtoType)
+function pack(msg::ProtoType)::Vector{UInt8}
     buf = IOBuffer()
     write(buf, false)
     write(buf, hton(UInt32(0)))
@@ -55,32 +54,17 @@ function serialize(msg::ProtoType)
     take!(buf)
 end
 
-function deserialize(data::Vector{UInt8}, msg::ProtoType)
-    buf = IOBuffer(data)
+function unpack(msg::Vector{UInt8}, ::Type{T})::T where T <: ProtoType
+    buf = IOBuffer(msg)
     if read(buf, Bool)
-        error("Compression not implemented")
-    end
-    @assert ntoh(read(buf, UInt32)) == length(data) - 5
-    readproto(buf, msg)
-end
-
-function send_message(connection::HTTPConnection, stream_id::UInt32,
-                      message::ProtoType, is_end = false)
-    put_act!(connection, ActSendData(stream_id, serialize(message), is_end))
-end
-
-function recv_message(connection::HTTPConnection, ::Type{T}) where T <: ProtoType
-    evt = take_evt!(connection)
-    if !(evt isa EvtRecvData)
-        throw(ProtocolError("Unexpected event $(typeof(evt))"))
+        throw(ProtocolError("Compression not implemented"))
     end
 
-    buf = IOBuffer(evt.data)
-    if data.size <= 5
-        throw(ProtocolError("Unexpected message length $(data.size)"))
+    len = ntoh(read(buf, UInt32))
+
+    if length(msg) !=  len + 5
+        throw(ProtocolError("Incorrect message data size"))
     end
 
-    ret = T()
-    deserialize(data, ret)
-    ret
+    readproto(buf, T())
 end
