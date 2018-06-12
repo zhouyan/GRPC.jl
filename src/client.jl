@@ -1,9 +1,9 @@
-import Base: put!, take!, fetch, isopen, collect, start, next, done
+import Base: put!, take!, fetch, open, close, isopen, collect, start, next, done
 import HttpCommon: Headers
 import HTTP2.Session: HTTPConnection
 import HTTP2.Session: ActSendHeaders, ActSendData
-import HTTP2.Session: EvtRecvHeaders, EvtRecvData, EvtGoaway
-import HTTP2.Session: new_connection, next_free_stream_identifier
+import HTTP2.Session: EvtRecvHeaders, EvtRecvData
+import HTTP2.Session: new_connection, next_free_stream_identifier, get_stream
 import HTTP2.Session: put_act!, take_evt!
 import ProtoBuf: ProtoType
 
@@ -73,16 +73,31 @@ function ClientChannel(host::AbstractString)
     ClientChannel(host, port)
 end
 
-function isopen(channel::ClientChannel, stream_id::UInt32)
-    haskey(channel.receiver, stream_id)
+function open(channel::ClientChannel, request::ServiceRequest)
+    stream_id = UInt32(next_free_stream_identifier(channel.connection))
+
+    if haskey(channel.receiver, stream_id)
+        throw(ProtocolError("Duplicate stream id"))
+    end
+
+    if channel.connection.last_stream_identifier <= stream_id
+        channel.connection.last_stream_identifier = stream_id
+    end
+
+    channel.receiver[stream_id] = Channel(32)
+    put_act!(channel.connection, ActSendHeaders(stream_id, request, false))
+
+    stream_id, channel.receiver[stream_id]
 end
 
-function put!(channel::ClientChannel, request::ServiceRequest,
-              stream_id::UInt32, isend::Bool)
-    if !isopen(channel, stream_id)
-        throw(ProtocolError("Stream removed"))
+function close(channel::ClientChannel, stream_id::UInt32)
+    if haskey(channel.receiver, stream_id)
+        delete!(channel.receiver, stream_id)
     end
-    put_act!(channel.connection, ActSendHeaders(stream_id, request, isend))
+end
+
+function isopen(channel::ClientChannel, stream_id::UInt32)
+    haskey(channel.receiver, stream_id)
 end
 
 function put!(channel::ClientChannel, message::ProtoType,
@@ -90,7 +105,6 @@ function put!(channel::ClientChannel, message::ProtoType,
     if !isopen(channel, stream_id)
         throw(ProtocolError("Stream removed"))
     end
-
     put_act!(channel.connection, ActSendData(stream_id, pack(message), isend))
 end
 
@@ -148,27 +162,21 @@ mutable struct ClientStream{T,U}
         ret.metadata = metadata
         ret.deadline = deadline
 
-        ret.stream_id = next_free_stream_identifier(ret.channel.connection)
+        request = ServiceRequest("POST", "http", method_name,
+                                 ret.channel.authority,
+                                 content_type = CONTENT_TYPE,
+                                 user_agent = "grpc-julia-GRPC",
+                                 metadata = metadata, deadline = deadline)
 
-        ret.receiver = Channel(32)
-        bind(ret.receiver, ret.channel.processor)
-        ret.channel.receiver[ret.stream_id] = ret.receiver
+        ret.stream_id, ret.receiver = open(ret.channel, request)
 
         ret.requests = Channel{Tuple{RequestType,Bool}}(32)
-
         ret.request_processor = @schedule begin
-            request = ServiceRequest("POST", "http", method_name,
-                                     ret.channel.authority,
-                                     content_type = CONTENT_TYPE,
-                                     user_agent = "grpc-julia-GRPC",
-                                     metadata = metadata, deadline = deadline)
-            put!(ret.channel, request, ret.stream_id, false)
             for (req, isend) in ret.requests
                 put!(ret.channel, req, ret.stream_id, isend)
                 yield()
             end
         end
-
         bind(ret.requests, ret.request_processor)
 
         ret.responses = Channel{ResponseType}(32)
@@ -233,6 +241,8 @@ mutable struct ClientStream{T,U}
             end
         end
         bind(ret.responses, ret.response_processor)
+
+        finalizer(ret, obj -> close(obj.channel, obj.stream_id))
 
         ret
     end
