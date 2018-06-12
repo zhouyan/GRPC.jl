@@ -4,6 +4,7 @@ import HTTP2.Session: HTTPConnection
 import HTTP2.Session: ActSendHeaders, ActSendData
 import HTTP2.Session: EvtRecvHeaders, EvtRecvData, EvtGoaway
 import HTTP2.Session: new_connection, next_free_stream_identifier
+import HTTP2.Session: put_act!, take_evt!
 import ProtoBuf: ProtoType
 
 ################################################################################
@@ -34,7 +35,7 @@ struct ClientChannel
                     break
                 end
 
-                evt = take!(connection)
+                evt = take_evt!(connection)
 
                 if !haskey(receiver, evt.stream_identifier)
                     throw(ProtocolError("Stream removed"))
@@ -81,7 +82,7 @@ function put!(channel::ClientChannel, request::ServiceRequest,
     if !isopen(channel, stream_id)
         throw(ProtocolError("Stream removed"))
     end
-    put!(channel.connection, ActSendHeaders(stream_id, request, isend))
+    put_act!(channel.connection, ActSendHeaders(stream_id, request, isend))
 end
 
 function put!(channel::ClientChannel, message::ProtoType,
@@ -90,7 +91,7 @@ function put!(channel::ClientChannel, message::ProtoType,
         throw(ProtocolError("Stream removed"))
     end
 
-    put!(channel.connection, ActSendData(stream_id, pack(message), isend))
+    put_act!(channel.connection, ActSendData(stream_id, pack(message), isend))
 end
 
 ################################################################################
