@@ -1,4 +1,3 @@
-import ProtoBuf: readproto, writeproto
 import ProtoBuf.Gen: codegen
 import ProtoBuf.GoogleProtoBuf: FileOptions
 import ProtoBuf.GoogleProtoBufCompiler: CodeGeneratorRequest

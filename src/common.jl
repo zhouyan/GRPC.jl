@@ -1,6 +1,3 @@
-import HTTP2.Session: HTTPConnection, ActSendData, EvtGoaway
-import ProtoBuf: ProtoType, writeproto, readproto, clear
-
 const CONTENT_TYPE = "application/grpc+proto"
 const CONTENT_TYPES = ("application/grpc", "application/grpc+proto")
 
@@ -27,13 +24,9 @@ eval(Expr(:macrocall, Symbol("@enum"), :Status,
            )
           )...))
 
-client_streaming(cardinality::Tuple{Bool,Bool}) = cardinality[1]
-server_streaming(cardinality::Tuple{Bool,Bool}) = cardinality[2]
-
 struct GRPCError <: Exception
     status::Status
     message::AbstractString
-
 end
 
 function GRPCError(status::Status)
