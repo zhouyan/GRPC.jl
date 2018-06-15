@@ -18,9 +18,11 @@ end
 
 mutable struct ClientStream{T,U}
     channel::ClientChannel
-    method_name::AbstractString
+    path::AbstractString
     metadata::Nullable{Headers}
     timeout::Nullable{Dates.Period}
+    headers::Nullable{Headers}
+    trailers::Nullable{Headers}
 
     stream_id::UInt32
     receiver::Channel
@@ -31,11 +33,8 @@ mutable struct ClientStream{T,U}
     responses::Channel{U}
     response_processor::Task
 
-    headers::Nullable{Headers}
-    trailers::Nullable{Headers}
-
     function ClientStream{RequestType, ResponseType}(channel::ClientChannel,
-                                                     method_name::AbstractString;
+                                                     path::AbstractString;
                                                      metadata = Nullable{Headers}(),
                                                      timeout = Nullable{Dates.Period}()) where
         {RequestType,ResponseType}
@@ -43,23 +42,26 @@ mutable struct ClientStream{T,U}
         ret = new{RequestType,ResponseType}()
 
         ret.channel = channel
-        ret.method_name = method_name
+        ret.path = path
         ret.metadata = metadata
         ret.timeout = timeout
+        ret.headers = Nullable{Headers}()
+        ret.trailers = Nullable{Headers}()
 
-        request = ClientRequest("POST", "http", method_name,
-                                ret.channel.authority,
+        request = ClientRequest("POST", "http", path, ret.channel.authority,
                                 metadata = metadata, timeout = timeout)
 
         ret.stream_id, ret.receiver = open(ret.channel, request)
 
         ret.requests = Channel{Tuple{RequestType,Bool}}(32)
+
         ret.request_processor = @schedule begin
             for (req, isend) in ret.requests
                 put!(ret.channel, req, ret.stream_id, isend)
                 yield()
             end
         end
+
         bind(ret.requests, ret.request_processor)
 
         ret.responses = Channel{ResponseType}(32)
@@ -70,14 +72,14 @@ mutable struct ClientStream{T,U}
             evt = take!(ret.receiver)
 
             if !(evt isa EvtRecvHeaders)
-                throw(ProtocolError("Failed to receive initial metadata"))
+                throw(ProtocolError("Headers: no initial metadata"))
             end
 
             ret.headers = evt.headers
             process_headers(evt.headers)
 
             if evt.is_end_stream
-                throw(ProtocolError("Failed to receive message data"))
+                throw(ProtocolError("Response: no message data"))
             end
 
             buffer = Vector{UInt8}()
@@ -91,17 +93,21 @@ mutable struct ClientStream{T,U}
                         process_trailers(evt.headers)
 
                         if !evt.is_end_stream
-                            throw(ProtocolError("Failed to receive end of stream"))
+                            throw(ProtocolError("Trailers: stream not ended"))
+                        end
+
+                        if !isempty(buffer)
+                            throw(ProtocolError("Trailers: unprocessed data"))
                         end
 
                         break
                     elseif evt.is_end_stream
-                        throw(ProtocolError("Failed to receive trailing metadata"))
+                        throw(ProtocolError("Trailers: no trailing metadata"))
                     end
 
                     append!(buffer, evt.data)
                     if length(buffer) < 5
-                        throw(ProtocolError("Incomplete message header"))
+                        throw(ProtocolError("Response: incomplete message header"))
                     end
                 end
 
@@ -109,7 +115,7 @@ mutable struct ClientStream{T,U}
                 while length(buffer) < len
                     evt = take!(ret.receiver)
                     if !(evt isa EvtRecvData)
-                        throw(ProtocolError("Incomplete message data"))
+                        throw(ProtocolError("Response: incomplete message data"))
                     end
                     append!(buffer, evt.data)
                 end
