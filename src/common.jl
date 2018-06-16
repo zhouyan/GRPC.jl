@@ -61,3 +61,32 @@ function unpack(msg::Vector{UInt8}, ::Type{T})::T where T <: ProtoType
 
     readproto(buf, T())
 end
+
+function new_connection(socket::TCPSocket;
+                        isclient = false, skip_preface = false)
+    settings = HTTPSettings(
+                            false, # push_enabled
+                            Nullable{UInt}(), # max_concurrent_streams
+                            (1 << 15) - 1, # initial_window_size
+                            (1 << 24) - 1, # max_frame_size
+                            Nullable{UInt}(), # max_header_list_size
+                            )
+
+    connection = HTTPConnection(
+                                new_dynamic_table(),  # dyanmic_table
+                                Vector{HTTPStream}(), # streams
+                                (1 << 15) - 1, # window_size
+                                isclient,  # isclient
+                                isclient ? 1 : 2, # last_stream_identifier
+                                settings, # settings
+                                false, # closed
+                                Channel(32), # channel_act
+                                Channel(32), # channel_act_raw
+                                Channel(32), # channel_evt
+                                Channel(32)  # channel_evt_raw
+                                )
+
+    initialize_loop_async(connection, socket, skip_preface = skip_preface)
+
+    connection
+end

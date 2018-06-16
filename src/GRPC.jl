@@ -9,12 +9,16 @@ import Base: open, close, isopen
 import Base: put!, take!, fetch, wait
 import Base: start, next, done
 
-using HTTP2.Session: HTTPConnection
-using HTTP2.Session: new_connection
+using HPack: new_dynamic_table
+
 using HTTP2.Session: ActSendHeaders, ActSendData
 using HTTP2.Session: EvtRecvHeaders, EvtRecvData
+using HTTP2.Session: HTTPConnection
+using HTTP2.Session: HTTPSettings
+using HTTP2.Session: HTTPStream
+using HTTP2.Session: initialize_loop_async
+using HTTP2.Session: next_free_stream_identifier
 using HTTP2.Session: put_act!, take_evt!
-using HTTP2.Session: new_connection, next_free_stream_identifier
 
 using HttpCommon: Headers
 
