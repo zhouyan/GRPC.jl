@@ -154,7 +154,7 @@ end
 
 function wait(stream::ClientStream{RequestType,ResponseType}) where
     {RequestType, ResponseType}
-    wait(stream.resopnses)
+    wait(stream.responses)
 end
 
 function close(stream::ClientStream{RequestType,ResponseType}) where
@@ -179,15 +179,15 @@ end
 
 function start(stream::ClientStream{RequestType,ResponseType}) where
     {RequestType, ResponseType}
-    start(stream.resopnse)
+    start(stream.responses)
 end
 
 function next(stream::ClientStream{RequestType,ResponseType}, state) where
     {RequestType, ResponseType}
-    next(stream.resopnse, state)
+    next(stream.responses, state)
 end
 
 function done(stream::ClientStream{RequestType,ResponseType}, state) where
     {RequestType, ResponseType}
-    done(stream.resopnse, state)
+    done(stream.responses, state)
 end
