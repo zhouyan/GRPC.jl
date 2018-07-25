@@ -157,9 +157,13 @@ function wait(stream::ClientStream{RequestType,ResponseType}) where
     wait(stream.responses)
 end
 
-function close(stream::ClientStream{RequestType,ResponseType}) where
-    {RequestType, ResponseType}
+function close(stream::ClientStream{RequestType,ResponseType},
+               quick_exit = true) where {RequestType, ResponseType}
     close(stream.requests)
+    if quick_exit
+        close(stream.receiver)
+        wait(response_processor)
+    end
 end
 
 function isopen(stream::ClientStream{RequestType,ResponseType}) where
