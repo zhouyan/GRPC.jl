@@ -58,6 +58,7 @@ mutable struct ClientStream{T,U}
         ret.request_processor = @schedule begin
             for (req, isend) in ret.requests
                 put!(ret.channel, req, ret.stream_id, isend)
+                yield()
             end
         end
 
@@ -122,10 +123,12 @@ mutable struct ClientStream{T,U}
                 if length(buffer) == len
                     put!(ret.responses, unpack(buffer, ResponseType))
                     resize!(buffer, 0)
+                    yield()
                 else
                     # TODO use splice view to reduce allocation
                     put!(ret.responses, unpack(buffer[1:len], ResponseType))
                     buffer = buffer[(len + 1):end]
+                    yield()
                 end
             end
         end
@@ -161,7 +164,7 @@ function close(stream::ClientStream{RequestType,ResponseType},
     close(stream.requests)
     if quick_exit
         close(stream.receiver)
-        wait(response_processor)
+        wait(stream.response_processor)
     end
 end
 
