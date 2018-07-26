@@ -58,7 +58,6 @@ mutable struct ClientStream{T,U}
         ret.request_processor = @schedule begin
             for (req, isend) in ret.requests
                 put!(ret.channel, req, ret.stream_id, isend)
-                yield()
             end
         end
 
