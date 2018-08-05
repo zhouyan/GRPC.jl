@@ -107,7 +107,7 @@ mutable struct ClientStream{T,U}
 
                     append!(buffer, evt.data)
                     if length(buffer) < 5
-                        throw(ProtocolError("Response: incomplete message header"))
+                        continue
                     end
                 end
 
